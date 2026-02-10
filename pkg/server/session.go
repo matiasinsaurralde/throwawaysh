@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -12,6 +13,38 @@ type exitStatus struct {
 	Status uint32
 }
 
+type ptyRequest struct {
+	Term    string
+	Columns uint32
+	Rows    uint32
+	PixelsX uint32
+	PixelsY uint32
+	Modes   string
+}
+
+type windowChangeRequest struct {
+	Columns uint32
+	Rows    uint32
+	PixelsX uint32
+	PixelsY uint32
+}
+
+type signalRequest struct {
+	Signal string
+}
+
+type sessionControlEvent struct {
+	ResizeRows    uint32
+	ResizeColumns uint32
+	Signal        string
+}
+
+type sessionStartRequest struct {
+	hasPTY      bool
+	pty         *ptyRequest
+	execCommand string
+}
+
 func handleSession(
 	cfg Config,
 	logger *slog.Logger,
@@ -19,8 +52,9 @@ func handleSession(
 	requests <-chan *ssh.Request,
 	remoteAddr, username string,
 ) {
-	sessionReady := make(chan struct{})
+	sessionReady := make(chan sessionStartRequest, 1)
 	sessionErr := make(chan error, 1)
+	sessionControl := make(chan sessionControlEvent, 16)
 
 	defer func() {
 		_ = channel.Close()
@@ -33,20 +67,76 @@ func handleSession(
 	}()
 
 	go func() {
+		defer close(sessionControl)
+
 		started := false
+		hasPTY := false
+		var ptyReq *ptyRequest
 		for req := range requests {
 			switch req.Type {
-			case "shell", "exec":
+			case "shell":
 				_ = req.Reply(true, nil)
 				if !started {
 					started = true
-					close(sessionReady)
+					sessionReady <- sessionStartRequest{
+						hasPTY: hasPTY,
+						pty:    ptyReq,
+					}
+				}
+			case "exec":
+				_ = req.Reply(true, nil)
+				if !started {
+					var payload struct {
+						Command string
+					}
+					if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+						sessionErr <- fmt.Errorf("invalid exec payload: %w", err)
+						return
+					}
+					started = true
+					sessionReady <- sessionStartRequest{
+						hasPTY:      hasPTY,
+						pty:         ptyReq,
+						execCommand: payload.Command,
+					}
 				}
 			case "env":
 				_ = req.Reply(true, nil)
-			case "pty-req", "window-change":
-				// v1 uses plain console stream mode, so PTY semantics are not handled yet.
-				_ = req.Reply(false, nil)
+			case "pty-req":
+				var payload ptyRequest
+				if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+					_ = req.Reply(false, nil)
+					sessionErr <- fmt.Errorf("invalid pty-req payload: %w", err)
+					return
+				}
+				hasPTY = true
+				ptyReq = &payload
+				_ = req.Reply(true, nil)
+			case "window-change":
+				var payload windowChangeRequest
+				if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				if started {
+					sessionControl <- sessionControlEvent{
+						ResizeRows:    payload.Rows,
+						ResizeColumns: payload.Columns,
+					}
+				}
+				_ = req.Reply(true, nil)
+			case "signal":
+				var payload signalRequest
+				if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				if started {
+					sessionControl <- sessionControlEvent{
+						Signal: payload.Signal,
+					}
+				}
+				_ = req.Reply(true, nil)
 			default:
 				_ = req.Reply(false, nil)
 			}
@@ -57,8 +147,9 @@ func handleSession(
 		}
 	}()
 
+	var startReq sessionStartRequest
 	select {
-	case <-sessionReady:
+	case startReq = <-sessionReady:
 	case reqErr := <-sessionErr:
 		logger.Error(
 			"session did not start",
@@ -80,7 +171,7 @@ func handleSession(
 		return
 	}
 
-	runErr := runKrunSession(cfg, logger, channel)
+	runErr := runKrunSession(cfg, logger, channel, startReq, sessionControl)
 	if runErr != nil {
 		logger.Error(
 			"session execution failed",

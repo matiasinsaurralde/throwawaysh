@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"log/slog"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +19,13 @@ import (
 var version = "dev"
 
 func main() {
+	if server.IsKrunSessionChildProcess() {
+		if err := server.RunKrunSessionChildFromEnv(); err != nil {
+			log.Fatalf("failed to run krun session child: %v", err)
+		}
+		return
+	}
+
 	result, err := cli.Parse(os.Args[1:])
 	if err != nil {
 		log.Fatalf("failed to parse flags: %v", err)
@@ -51,13 +60,51 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	go func() {
+		<-sigCh
+		logger.Info("shutdown signal received", "event", "shutdown_signal_received")
+		cancel()
+
+		// If graceful shutdown gets stuck, a second signal forces exit.
+		<-sigCh
+		logger.Warn("forcing immediate exit", "event", "shutdown_forced")
+		os.Exit(130)
+	}()
+
+	// Fallback for terminals/environments where Ctrl+C is delivered
+	// as a raw byte instead of SIGINT.
+	go watchStdinInterrupt(logger, cancel)
 
 	runErr := srv.Run(ctx)
-	cancel()
 	if runErr != nil {
 		logger.Error("server exited with error", "event", "server_runtime_error", "error", runErr.Error())
 		os.Exit(1)
+	}
+}
+
+func watchStdinInterrupt(logger *slog.Logger, cancel context.CancelFunc) {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			// stdin closed or unavailable; no fallback input possible.
+			if err == io.EOF {
+				return
+			}
+			return
+		}
+		if b == 3 {
+			logger.Info("stdin interrupt received", "event", "shutdown_stdin_interrupt")
+			cancel()
+			return
+		}
 	}
 }
 

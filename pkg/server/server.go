@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -14,6 +15,10 @@ type Server struct {
 	cfg       Config
 	logger    *slog.Logger
 	sshConfig *ssh.ServerConfig
+
+	mu       sync.Mutex
+	listener net.Listener
+	conns    map[net.Conn]struct{}
 }
 
 func New(cfg Config, signer ssh.Signer, logger *slog.Logger) (*Server, error) {
@@ -24,6 +29,7 @@ func New(cfg Config, signer ssh.Signer, logger *slog.Logger) (*Server, error) {
 	server := &Server{
 		cfg:    cfg,
 		logger: logger,
+		conns:  make(map[net.Conn]struct{}),
 	}
 	server.sshConfig = server.buildSSHConfig(signer)
 	return server, nil
@@ -34,7 +40,9 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.ListenAddr, err)
 	}
+	s.setListener(listener)
 	defer func() {
+		s.clearListener()
 		_ = listener.Close()
 	}()
 
@@ -49,12 +57,13 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
+		s.closeAllConns()
 	}()
 
 	for {
 		conn, acceptErr := listener.Accept()
 		if acceptErr != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
 				s.logger.InfoContext(ctx, "service stopped", "event", "service_stopped")
 				return nil
 			}
@@ -74,6 +83,7 @@ func (s *Server) Run(ctx context.Context) error {
 			"remote_addr", conn.RemoteAddr().String(),
 		)
 
+		s.trackConn(conn)
 		go s.handleConn(conn)
 	}
 }
@@ -115,6 +125,7 @@ func (s *Server) buildSSHConfig(signer ssh.Signer) *ssh.ServerConfig {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer func() {
+		s.untrackConn(conn)
 		_ = conn.Close()
 	}()
 
@@ -179,4 +190,36 @@ func (s *Server) authMode() string {
 		return "passwordless"
 	}
 	return "password"
+}
+
+func (s *Server) setListener(listener net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listener = listener
+}
+
+func (s *Server) clearListener() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listener = nil
+}
+
+func (s *Server) trackConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conns[conn] = struct{}{}
+}
+
+func (s *Server) untrackConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.conns, conn)
+}
+
+func (s *Server) closeAllConns() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
 }
