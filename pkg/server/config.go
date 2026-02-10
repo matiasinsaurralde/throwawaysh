@@ -7,16 +7,18 @@ import (
 )
 
 const (
-	DefaultListenAddr  = ":2222"
-	DefaultHostKeyPath = "server_key"
-	DefaultUsername    = "test"
-	DefaultPassword    = "test"
-	DefaultLogLevel    = "info"
-	DefaultLogFormat   = "text"
+	DefaultListenAddr     = ":2222"
+	DefaultHTTPListenAddr = ":8080"
+	DefaultHostKeyPath    = "server_key"
+	DefaultUsername       = "test"
+	DefaultPassword       = "test"
+	DefaultLogLevel       = "info"
+	DefaultLogFormat      = "text"
 )
 
 type Config struct {
 	ListenAddr        string
+	HTTPListenAddr    string
 	HostKeyPath       string
 	RootFS            string
 	Username          string
@@ -29,6 +31,9 @@ type Config struct {
 func (c Config) Validate() error {
 	if c.ListenAddr == "" {
 		return errors.New("listen address is required")
+	}
+	if c.HTTPListenAddr == "" {
+		return errors.New("http listen address is required")
 	}
 	if c.HostKeyPath == "" {
 		return errors.New("host key path is required")

@@ -95,9 +95,10 @@ func runKrunSession(
 	channel ssh.Channel,
 	startReq sessionStartRequest,
 	sessionControl <-chan sessionControlEvent,
+	session *trackedSession,
 ) error {
 	if startReq.hasPTY {
-		return runKrunPTYSession(cfg, logger, channel, startReq, sessionControl)
+		return runKrunPTYSession(cfg, logger, channel, startReq, sessionControl, session)
 	}
 
 	execPath, err := os.Executable()
@@ -114,9 +115,15 @@ func runKrunSession(
 		krunChildExecCommandEnv+"="+startReq.execCommand,
 		"TERM="+resolveTERM(startReq),
 	)
-	cmd.Stdin = channel
-	cmd.Stdout = channel
-	cmd.Stderr = channel.Stderr()
+	if session != nil {
+		cmd.Stdin = io.TeeReader(channel, &sessionLogWriter{session: session, direction: "in"})
+		cmd.Stdout = io.MultiWriter(channel, &sessionLogWriter{session: session, direction: "out"})
+		cmd.Stderr = io.MultiWriter(channel.Stderr(), &sessionLogWriter{session: session, direction: "out"})
+	} else {
+		cmd.Stdin = channel
+		cmd.Stdout = channel
+		cmd.Stderr = channel.Stderr()
+	}
 
 	logger.Info("starting krun vm for ssh session", "event", "session_vm_start")
 	if err := cmd.Run(); err != nil {
@@ -133,6 +140,7 @@ func runKrunPTYSession(
 	channel ssh.Channel,
 	startReq sessionStartRequest,
 	sessionControl <-chan sessionControlEvent,
+	session *trackedSession,
 ) error {
 	guestAgentPath := filepath.Join(cfg.RootFS, strings.TrimPrefix(defaultGuestAgentExecPath, "/"))
 	if _, err := os.Stat(guestAgentPath); err != nil {
@@ -243,9 +251,9 @@ func runKrunPTYSession(
 
 	agentErrCh := make(chan error, 1)
 	agentExitCodeCh := make(chan int, 1)
-	go readGuestAgentFrames(logger, agentConn, channel, agentErrCh, agentExitCodeCh)
+	go readGuestAgentFrames(logger, agentConn, channel, session, agentErrCh, agentExitCodeCh)
 
-	go forwardChannelInputToAgent(logger, agentConn, channel)
+	go forwardChannelInputToAgent(logger, agentConn, channel, session)
 	go forwardSessionControlToAgent(logger, agentConn, sessionControl)
 
 	cmdWaitCh := make(chan error, 1)
@@ -438,6 +446,7 @@ func readGuestAgentFrames(
 	logger *slog.Logger,
 	conn net.Conn,
 	channel ssh.Channel,
+	session *trackedSession,
 	errCh chan<- error,
 	exitCodeCh chan<- int,
 ) {
@@ -456,6 +465,9 @@ func readGuestAgentFrames(
 		switch frameType {
 		case agentproto.FrameOutput:
 			if len(payload) > 0 {
+				if session != nil {
+					session.LogOutput(payload)
+				}
 				if _, writeErr := channel.Write(payload); writeErr != nil {
 					errCh <- fmt.Errorf("write agent output to ssh channel: %w", writeErr)
 					return
@@ -463,6 +475,9 @@ func readGuestAgentFrames(
 			}
 		case agentproto.FrameError:
 			if len(payload) > 0 {
+				if session != nil {
+					session.LogOutput(payload)
+				}
 				logger.Warn(
 					"guest-agent reported error frame",
 					"event", "guest_agent_error_frame",
@@ -486,7 +501,7 @@ func readGuestAgentFrames(
 	}
 }
 
-func forwardChannelInputToAgent(logger *slog.Logger, conn net.Conn, channel ssh.Channel) {
+func forwardChannelInputToAgent(logger *slog.Logger, conn net.Conn, channel ssh.Channel, session *trackedSession) {
 	type closeWriter interface {
 		CloseWrite() error
 	}
@@ -495,6 +510,9 @@ func forwardChannelInputToAgent(logger *slog.Logger, conn net.Conn, channel ssh.
 	for {
 		readBytes, err := channel.Read(buffer)
 		if readBytes > 0 {
+			if session != nil {
+				session.LogInput(buffer[:readBytes])
+			}
 			if writeErr := agentproto.WriteFrame(conn, agentproto.FrameStdin, buffer[:readBytes]); writeErr != nil {
 				logger.Warn(
 					"failed forwarding stdin frame to guest-agent",
@@ -554,6 +572,23 @@ func childDebugf(stderr io.Writer, format string, args ...any) {
 		return
 	}
 	_, _ = fmt.Fprintf(stderr, "[throwawaysh-child] "+format+"\n", args...)
+}
+
+type sessionLogWriter struct {
+	session   *trackedSession
+	direction string
+}
+
+func (writer *sessionLogWriter) Write(payload []byte) (int, error) {
+	if writer.session == nil {
+		return len(payload), nil
+	}
+	if writer.direction == "in" {
+		writer.session.LogInput(payload)
+		return len(payload), nil
+	}
+	writer.session.LogOutput(payload)
+	return len(payload), nil
 }
 
 func logVMChildStream(logger *slog.Logger, stream string, reader io.Reader) {

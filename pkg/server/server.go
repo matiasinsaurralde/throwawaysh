@@ -15,6 +15,7 @@ type Server struct {
 	cfg       Config
 	logger    *slog.Logger
 	sshConfig *ssh.ServerConfig
+	tracker   *SessionTracker
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -27,9 +28,10 @@ func New(cfg Config, signer ssh.Signer, logger *slog.Logger) (*Server, error) {
 	}
 
 	server := &Server{
-		cfg:    cfg,
-		logger: logger,
-		conns:  make(map[net.Conn]struct{}),
+		cfg:     cfg,
+		logger:  logger,
+		tracker: NewSessionTracker(logger),
+		conns:   make(map[net.Conn]struct{}),
 	}
 	server.sshConfig = server.buildSSHConfig(signer)
 	return server, nil
@@ -51,6 +53,7 @@ func (s *Server) Run(ctx context.Context) error {
 		"service started",
 		"event", "service_started",
 		"listen_addr", s.cfg.ListenAddr,
+		"http_listen_addr", s.cfg.HTTPListenAddr,
 		"auth_mode", s.authMode(),
 	)
 
@@ -60,11 +63,29 @@ func (s *Server) Run(ctx context.Context) error {
 		s.closeAllConns()
 	}()
 
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- s.runSSHListener(ctx, listener)
+	}()
+	go func() {
+		errCh <- s.runHTTPServer(ctx)
+	}()
+
+	for completed := 0; completed < 2; completed++ {
+		runErr := <-errCh
+		if runErr != nil {
+			return runErr
+		}
+	}
+	s.logger.InfoContext(ctx, "service stopped", "event", "service_stopped")
+	return nil
+}
+
+func (s *Server) runSSHListener(ctx context.Context, listener net.Listener) error {
 	for {
 		conn, acceptErr := listener.Accept()
 		if acceptErr != nil {
 			if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
-				s.logger.InfoContext(ctx, "service stopped", "event", "service_stopped")
 				return nil
 			}
 			s.logger.ErrorContext(
@@ -181,7 +202,15 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		go handleSession(s.cfg, s.logger, channel, requests, serverConn.RemoteAddr().String(), serverConn.User())
+		go handleSession(
+			s.cfg,
+			s.logger,
+			s.tracker,
+			channel,
+			requests,
+			serverConn.RemoteAddr().String(),
+			serverConn.User(),
+		)
 	}
 }
 

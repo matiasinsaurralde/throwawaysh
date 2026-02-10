@@ -50,10 +50,28 @@ type sessionStartRequest struct {
 func handleSession(
 	cfg Config,
 	logger *slog.Logger,
+	tracker *SessionTracker,
 	channel ssh.Channel,
 	requests <-chan *ssh.Request,
 	remoteAddr, username string,
 ) {
+	var session *trackedSession
+	if tracker != nil {
+		tracked, err := tracker.Start(remoteAddr, username)
+		if err != nil {
+			logger.Warn(
+				"failed to initialize session tracker",
+				"event", "session_tracker_init_failed",
+				"remote_addr", remoteAddr,
+				"username", username,
+				"error", err.Error(),
+			)
+		} else {
+			session = tracked
+			defer tracker.End(tracked.ID())
+		}
+	}
+
 	sessionReady := make(chan sessionStartRequest, 1)
 	sessionErr := make(chan error, 1)
 	sessionControl := make(chan sessionControlEvent, 16)
@@ -183,7 +201,7 @@ func handleSession(
 		return
 	}
 
-	runErr := runKrunSession(cfg, logger, channel, startReq, sessionControl)
+	runErr := runKrunSession(cfg, logger, channel, startReq, sessionControl, session)
 	if runErr != nil {
 		logger.Error(
 			"session execution failed",

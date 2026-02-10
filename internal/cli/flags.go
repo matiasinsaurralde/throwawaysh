@@ -20,6 +20,7 @@ func Parse(args []string) (ParseResult, error) {
 	fs := flag.NewFlagSet("throwawaysh", flag.ContinueOnError)
 
 	listenAddr := fs.String("listen-addr", "", "SSH listen address (for example, :2222)")
+	httpListenAddr := fs.String("http-listen-addr", "", "HTTP listen address (for example, :8080)")
 	hostKeyPath := fs.String("host-key-path", "", "Path to the SSH host private key")
 	rootFS := fs.String("rootfs", "", "Path to root filesystem directory")
 	username := fs.String("username", "", "Username required for password auth")
@@ -54,6 +55,12 @@ func Parse(args []string) (ParseResult, error) {
 			*listenAddr,
 			"SSH_ADDR",
 			server.DefaultListenAddr,
+		),
+		HTTPListenAddr: resolveString(
+			visited["http-listen-addr"],
+			*httpListenAddr,
+			"SSH_HTTP_ADDR",
+			server.DefaultHTTPListenAddr,
 		),
 		HostKeyPath: resolveString(
 			visited["host-key-path"],
