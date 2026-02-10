@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -167,8 +168,24 @@ func runKrunPTYSession(
 		krunChildAgentDebugEnv+"=1",
 		"TERM="+resolveTERM(startReq),
 	)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", os.DevNull, err)
+	}
+	defer func() {
+		_ = devNull.Close()
+	}()
+	// Keep child stdin detached from the service terminal to avoid stealing
+	// line discipline state (raw/canonical mode) from the host TTY.
+	cmd.Stdin = devNull
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("create vm child stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("create vm child stderr pipe: %w", err)
+	}
 
 	logger.Info(
 		"starting krun vm guest-agent pty session",
@@ -191,6 +208,8 @@ func runKrunPTYSession(
 		return fmt.Errorf("start vm child process: %w", err)
 	}
 	logger.Debug("vm child process started", "event", "session_vm_child_started", "pid", cmd.Process.Pid)
+	go logVMChildStream(logger, "stdout", stdoutPipe)
+	go logVMChildStream(logger, "stderr", stderrPipe)
 
 	agentConn, err := acceptAgentSocket(listener, 20*time.Second, logger)
 	if err != nil {
@@ -535,4 +554,39 @@ func childDebugf(stderr io.Writer, format string, args ...any) {
 		return
 	}
 	_, _ = fmt.Fprintf(stderr, "[throwawaysh-child] "+format+"\n", args...)
+}
+
+func logVMChildStream(logger *slog.Logger, stream string, reader io.Reader) {
+	scanner := bufio.NewScanner(reader)
+	scanBuffer := make([]byte, 0, 64*1024)
+	scanner.Buffer(scanBuffer, 1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		logger.Info(
+			"vm child output",
+			"event", "session_vm_child_output",
+			"stream", stream,
+			"line", line,
+		)
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.Debug(
+			"vm child output stream ended with error",
+			"event", "session_vm_child_output_stream_error",
+			"stream", stream,
+			"error", err.Error(),
+		)
+		return
+	}
+
+	logger.Debug(
+		"vm child output stream ended",
+		"event", "session_vm_child_output_stream_end",
+		"stream", stream,
+	)
 }

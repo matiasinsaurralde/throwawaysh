@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"log/slog"
-	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -78,33 +76,10 @@ func main() {
 		os.Exit(130)
 	}()
 
-	// Fallback for terminals/environments where Ctrl+C is delivered
-	// as a raw byte instead of SIGINT.
-	go watchStdinInterrupt(logger, cancel)
-
 	runErr := srv.Run(ctx)
 	if runErr != nil {
 		logger.Error("server exited with error", "event", "server_runtime_error", "error", runErr.Error())
 		os.Exit(1)
-	}
-}
-
-func watchStdinInterrupt(logger *slog.Logger, cancel context.CancelFunc) {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		b, err := reader.ReadByte()
-		if err != nil {
-			// stdin closed or unavailable; no fallback input possible.
-			if err == io.EOF {
-				return
-			}
-			return
-		}
-		if b == 3 {
-			logger.Info("stdin interrupt received", "event", "shutdown_stdin_interrupt")
-			cancel()
-			return
-		}
 	}
 }
 
