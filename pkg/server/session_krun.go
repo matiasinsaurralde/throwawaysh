@@ -14,6 +14,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/mishushakov/libkrun-go/krun"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -116,6 +117,13 @@ func runKrunPTYSession(
 			Rows: uint16(startReq.pty.Rows),
 			Cols: uint16(startReq.pty.Columns),
 		})
+	}
+	if err := configureHostPTY(tty, startReq.terminalModes); err != nil {
+		logger.Warn(
+			"failed to apply pty host terminal settings",
+			"event", "session_pty_mode_apply_failed",
+			"error", err.Error(),
+		)
 	}
 
 	cmd := exec.Command(execPath)
@@ -294,4 +302,65 @@ func forwardSSHSignal(process *os.Process, signalName string) error {
 	}
 
 	return process.Signal(sig)
+}
+
+func configureHostPTY(tty *os.File, modes ssh.TerminalModes) error {
+	termios, setRequest, err := getTTYTermios(tty.Fd())
+	if err != nil {
+		return err
+	}
+
+	// Keep this host PTY as a transport layer and avoid double line discipline
+	// with the guest shell TTY.
+	makeTermiosRaw(termios)
+	applyControlChars(termios, modes)
+	applyLineSpeed(termios, modes)
+
+	return unix.IoctlSetTermios(int(tty.Fd()), setRequest, termios)
+}
+
+func getTTYTermios(fd uintptr) (*unix.Termios, uint, error) {
+	getRequest, setRequest := termiosGetSetRequests()
+	termios, err := unix.IoctlGetTermios(int(fd), getRequest)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get tty termios: %w", err)
+	}
+	return termios, setRequest, nil
+}
+
+func makeTermiosRaw(termios *unix.Termios) {
+	termios.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+	termios.Oflag &^= unix.OPOST
+	termios.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+	termios.Cflag &^= unix.CSIZE | unix.PARENB
+	termios.Cflag |= unix.CS8
+	termios.Cc[unix.VMIN] = 1
+	termios.Cc[unix.VTIME] = 0
+}
+
+func applyControlChars(termios *unix.Termios, modes ssh.TerminalModes) {
+	controlCharMappings := map[uint8]uint8{
+		ssh.VINTR:    unix.VINTR,
+		ssh.VQUIT:    unix.VQUIT,
+		ssh.VERASE:   unix.VERASE,
+		ssh.VKILL:    unix.VKILL,
+		ssh.VEOF:     unix.VEOF,
+		ssh.VEOL:     unix.VEOL,
+		ssh.VEOL2:    unix.VEOL2,
+		ssh.VSTART:   unix.VSTART,
+		ssh.VSTOP:    unix.VSTOP,
+		ssh.VSUSP:    unix.VSUSP,
+		ssh.VREPRINT: unix.VREPRINT,
+		ssh.VWERASE:  unix.VWERASE,
+		ssh.VLNEXT:   unix.VLNEXT,
+		ssh.VDISCARD: unix.VDISCARD,
+	}
+
+	for sshOpcode, ccIndex := range controlCharMappings {
+		value, exists := modes[sshOpcode]
+		if !exists {
+			continue
+		}
+		termios.Cc[ccIndex] = uint8(value)
+	}
 }

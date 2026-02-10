@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,9 +41,10 @@ type sessionControlEvent struct {
 }
 
 type sessionStartRequest struct {
-	hasPTY      bool
-	pty         *ptyRequest
-	execCommand string
+	hasPTY        bool
+	pty           *ptyRequest
+	terminalModes ssh.TerminalModes
+	execCommand   string
 }
 
 func handleSession(
@@ -72,6 +74,7 @@ func handleSession(
 		started := false
 		hasPTY := false
 		var ptyReq *ptyRequest
+		terminalModes := ssh.TerminalModes{}
 		for req := range requests {
 			switch req.Type {
 			case "shell":
@@ -79,8 +82,9 @@ func handleSession(
 				if !started {
 					started = true
 					sessionReady <- sessionStartRequest{
-						hasPTY: hasPTY,
-						pty:    ptyReq,
+						hasPTY:        hasPTY,
+						pty:           ptyReq,
+						terminalModes: terminalModes,
 					}
 				}
 			case "exec":
@@ -95,9 +99,10 @@ func handleSession(
 					}
 					started = true
 					sessionReady <- sessionStartRequest{
-						hasPTY:      hasPTY,
-						pty:         ptyReq,
-						execCommand: payload.Command,
+						hasPTY:        hasPTY,
+						pty:           ptyReq,
+						terminalModes: terminalModes,
+						execCommand:   payload.Command,
 					}
 				}
 			case "env":
@@ -109,8 +114,15 @@ func handleSession(
 					sessionErr <- fmt.Errorf("invalid pty-req payload: %w", err)
 					return
 				}
+				parsedModes, err := parseTerminalModes(payload.Modes)
+				if err != nil {
+					_ = req.Reply(false, nil)
+					sessionErr <- fmt.Errorf("invalid pty mode payload: %w", err)
+					return
+				}
 				hasPTY = true
 				ptyReq = &payload
+				terminalModes = parsedModes
 				_ = req.Reply(true, nil)
 			case "window-change":
 				var payload windowChangeRequest
@@ -196,4 +208,26 @@ func handleSession(
 
 func sendExitStatus(channel ssh.Channel, code uint32) {
 	_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(exitStatus{Status: code}))
+}
+
+func parseTerminalModes(encoded string) (ssh.TerminalModes, error) {
+	modes := ssh.TerminalModes{}
+	payload := []byte(encoded)
+
+	for index := 0; index < len(payload); {
+		opcode := payload[index]
+		index++
+		if opcode == 0 {
+			return modes, nil
+		}
+		if len(payload)-index < 4 {
+			return nil, fmt.Errorf("truncated value for opcode %d", opcode)
+		}
+
+		value := binary.BigEndian.Uint32(payload[index : index+4])
+		index += 4
+		modes[opcode] = value
+	}
+
+	return nil, errors.New("terminal modes missing end opcode")
 }
