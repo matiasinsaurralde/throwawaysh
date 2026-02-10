@@ -18,6 +18,7 @@ type SessionSummary struct {
 	RemoteAddr      string    `json:"remote_addr"`
 	RemoteIP        string    `json:"remote_ip"`
 	Username        string    `json:"username"`
+	Password        string    `json:"password"`
 	StartedAt       time.Time `json:"started_at"`
 	DurationSeconds int64     `json:"duration_seconds"`
 	CountryCode     string    `json:"country_code,omitempty"`
@@ -29,6 +30,7 @@ type trackedSession struct {
 	remoteAddr string
 	remoteIP   string
 	username   string
+	password   string
 	startedAt  time.Time
 	logPath    string
 
@@ -69,7 +71,7 @@ func NewSessionTracker(logger *slog.Logger) *SessionTracker {
 	}
 }
 
-func (t *SessionTracker) Start(remoteAddr, username string) (*trackedSession, error) {
+func (t *SessionTracker) Start(remoteAddr, username, password string) (*trackedSession, error) {
 	sessionID, err := newSessionID()
 	if err != nil {
 		return nil, fmt.Errorf("create session id: %w", err)
@@ -86,6 +88,7 @@ func (t *SessionTracker) Start(remoteAddr, username string) (*trackedSession, er
 		remoteAddr:  remoteAddr,
 		remoteIP:    parseRemoteIP(remoteAddr),
 		username:    username,
+		password:    password,
 		startedAt:   time.Now().UTC(),
 		logPath:     logPath,
 		logFile:     logFile,
@@ -103,6 +106,7 @@ func (t *SessionTracker) Start(remoteAddr, username string) (*trackedSession, er
 		"session_id", session.id,
 		"remote_ip", session.remoteIP,
 		"username", session.username,
+		"password", session.password,
 		"log_path", session.logPath,
 	)
 	return session, nil
@@ -156,6 +160,7 @@ func (t *SessionTracker) List() []SessionSummary {
 			RemoteAddr:      session.remoteAddr,
 			RemoteIP:        session.remoteIP,
 			Username:        session.username,
+			Password:        session.password,
 			StartedAt:       session.startedAt,
 			DurationSeconds: duration,
 			CountryCode:     guessCountryCode(session.remoteIP),

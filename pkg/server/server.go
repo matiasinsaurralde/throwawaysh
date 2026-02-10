@@ -11,6 +11,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const (
+	authUsernameExtensionKey = "auth_username"
+	authPasswordExtensionKey = "auth_password"
+)
+
 type Server struct {
 	cfg       Config
 	logger    *slog.Logger
@@ -118,25 +123,20 @@ func (s *Server) buildSSHConfig(signer ssh.Signer) *ssh.ServerConfig {
 		cfg.PasswordCallback = func(conn ssh.ConnMetadata, provided []byte) (*ssh.Permissions, error) {
 			username := conn.User()
 			remoteAddr := conn.RemoteAddr().String()
-			if username == s.cfg.Username && string(provided) == s.cfg.Password {
-				s.logger.Info(
-					"authentication successful",
-					"event", "auth_success",
-					"remote_addr", remoteAddr,
-					"username", username,
-					"auth_mode", "password",
-				)
-				return &ssh.Permissions{}, nil
-			}
-
-			s.logger.Warn(
-				"authentication failed",
-				"event", "auth_failed",
+			s.logger.Info(
+				"authentication successful",
+				"event", "auth_success",
 				"remote_addr", remoteAddr,
 				"username", username,
-				"auth_mode", "password",
+				"auth_mode", "password_any",
+				"password_length", len(provided),
 			)
-			return nil, errors.New("invalid credentials")
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					authUsernameExtensionKey: username,
+					authPasswordExtensionKey: string(provided),
+				},
+			}, nil
 		}
 	}
 
@@ -202,6 +202,20 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		authUsername := serverConn.User()
+		authPassword := "<none>"
+		if serverConn.Permissions != nil {
+			if value, ok := serverConn.Permissions.Extensions[authUsernameExtensionKey]; ok && value != "" {
+				authUsername = value
+			}
+			if value, ok := serverConn.Permissions.Extensions[authPasswordExtensionKey]; ok {
+				authPassword = value
+			}
+		}
+		if s.cfg.AllowPasswordless {
+			authPassword = "<passwordless>"
+		}
+
 		go handleSession(
 			s.cfg,
 			s.logger,
@@ -209,7 +223,8 @@ func (s *Server) handleConn(conn net.Conn) {
 			channel,
 			requests,
 			serverConn.RemoteAddr().String(),
-			serverConn.User(),
+			authUsername,
+			authPassword,
 		)
 	}
 }

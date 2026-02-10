@@ -72,7 +72,7 @@ const indexHTMLPage = `<!doctype html>
       position: absolute;
       top: -22px;
       left: -6px;
-      white-space: nowrap;
+      white-space: pre;
       font-size: 11px;
       color: #b7ffd2;
       background: rgba(0, 0, 0, 0.65);
@@ -117,7 +117,7 @@ const indexHTMLPage = `<!doctype html>
 <body>
   <div class="container">
     <section class="left">
-      <div class="title">Session Constellation</div>
+      <div class="title">Sessions</div>
       <div class="status" id="nodeStatus">0 active sessions</div>
       <div class="universe" id="universe"></div>
     </section>
@@ -236,7 +236,9 @@ const indexHTMLPage = `<!doctype html>
         const label = document.createElement('div');
         label.className = 'node-label';
         const flag = session.country_flag ? session.country_flag + ' ' : '';
-        label.textContent = flag + session.remote_ip + ' [' + humanDuration(session.duration_seconds) + ']';
+        label.textContent =
+          flag + session.remote_ip + ' [' + humanDuration(session.duration_seconds) + ']\n' +
+          'user: ' + (session.username || '<none>') + ' pass: ' + (session.password || '<none>');
         node.appendChild(label);
 
         node.addEventListener('click', () => {

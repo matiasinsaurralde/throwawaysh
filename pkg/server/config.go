@@ -41,15 +41,6 @@ func (c Config) Validate() error {
 	if c.RootFS == "" {
 		return errors.New("rootfs is required")
 	}
-	if !c.AllowPasswordless {
-		if c.Username == "" {
-			return errors.New("username is required when passwordless mode is disabled")
-		}
-		if c.Password == "" {
-			return errors.New("password is required when passwordless mode is disabled")
-		}
-	}
-
 	validLevels := []string{"debug", "info", "warn", "error"}
 	if !slices.Contains(validLevels, c.LogLevel) {
 		return fmt.Errorf("invalid log level %q (expected: debug|info|warn|error)", c.LogLevel)

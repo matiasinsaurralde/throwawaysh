@@ -53,11 +53,11 @@ func handleSession(
 	tracker *SessionTracker,
 	channel ssh.Channel,
 	requests <-chan *ssh.Request,
-	remoteAddr, username string,
+	remoteAddr, username, password string,
 ) {
 	var session *trackedSession
 	if tracker != nil {
-		tracked, err := tracker.Start(remoteAddr, username)
+		tracked, err := tracker.Start(remoteAddr, username, password)
 		if err != nil {
 			logger.Warn(
 				"failed to initialize session tracker",
