@@ -33,6 +33,9 @@ func (c Config) Validate() error {
 	if c.HostKeyPath == "" {
 		return errors.New("host key path is required")
 	}
+	if c.RootFS == "" {
+		return errors.New("rootfs is required")
+	}
 	if !c.AllowPasswordless {
 		if c.Username == "" {
 			return errors.New("username is required when passwordless mode is disabled")

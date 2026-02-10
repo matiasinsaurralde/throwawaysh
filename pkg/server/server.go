@@ -170,7 +170,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		go handleSession(s.logger, channel, requests, serverConn.RemoteAddr().String(), serverConn.User())
+		go handleSession(s.cfg, s.logger, channel, requests, serverConn.RemoteAddr().String(), serverConn.User())
 	}
 }
 
