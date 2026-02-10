@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
+	"time"
 
-	"github.com/creack/pty"
+	"github.com/matiasinsaurralde/throwawaysh/pkg/agentproto"
 	"github.com/mishushakov/libkrun-go/krun"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -22,6 +24,13 @@ const (
 	krunChildRootFSEnv      = "THROWAWAYSH_KRUN_ROOTFS"
 	krunChildInteractiveEnv = "THROWAWAYSH_KRUN_INTERACTIVE"
 	krunChildExecCommandEnv = "THROWAWAYSH_KRUN_EXEC_COMMAND"
+	krunChildUseGuestAgent  = "THROWAWAYSH_KRUN_USE_GUEST_AGENT"
+	krunChildAgentPortEnv   = "THROWAWAYSH_KRUN_AGENT_PORT"
+	krunChildAgentSockEnv   = "THROWAWAYSH_KRUN_AGENT_SOCKET_PATH"
+	krunChildAgentExecEnv   = "THROWAWAYSH_KRUN_AGENT_EXEC_PATH"
+	krunChildAgentDebugEnv  = "THROWAWAYSH_KRUN_AGENT_DEBUG"
+
+	defaultGuestAgentExecPath = "/usr/local/bin/throwawaysh-guest-agent"
 )
 
 var (
@@ -50,7 +59,33 @@ func RunKrunSessionChildFromEnv() error {
 	}
 	interactive := os.Getenv(krunChildInteractiveEnv) == "1"
 	execCommand := os.Getenv(krunChildExecCommandEnv)
-	return runKrunInCurrentProcess(rootFS, interactive, execCommand, os.Stdin, os.Stdout, os.Stderr)
+	useGuestAgent := os.Getenv(krunChildUseGuestAgent) == "1"
+	guestAgentPort := uint32(4000)
+	if portValue := os.Getenv(krunChildAgentPortEnv); portValue != "" {
+		parsedPort, err := strconv.ParseUint(portValue, 10, 32)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", krunChildAgentPortEnv, err)
+		}
+		guestAgentPort = uint32(parsedPort)
+	}
+	guestAgentSocketPath := os.Getenv(krunChildAgentSockEnv)
+	guestAgentExecPath := os.Getenv(krunChildAgentExecEnv)
+	if guestAgentExecPath == "" {
+		guestAgentExecPath = defaultGuestAgentExecPath
+	}
+
+	return runKrunInCurrentProcess(
+		rootFS,
+		interactive,
+		execCommand,
+		useGuestAgent,
+		guestAgentPort,
+		guestAgentSocketPath,
+		guestAgentExecPath,
+		os.Stdin,
+		os.Stdout,
+		os.Stderr,
+	)
 }
 
 func runKrunSession(
@@ -98,32 +133,24 @@ func runKrunPTYSession(
 	startReq sessionStartRequest,
 	sessionControl <-chan sessionControlEvent,
 ) error {
+	guestAgentPath := filepath.Join(cfg.RootFS, strings.TrimPrefix(defaultGuestAgentExecPath, "/"))
+	if _, err := os.Stat(guestAgentPath); err != nil {
+		return fmt.Errorf("guest agent not found in rootfs at %s: %w", guestAgentPath, err)
+	}
+
+	socketPath := filepath.Join(
+		os.TempDir(),
+		fmt.Sprintf("throwawaysh-agent-%d.sock", time.Now().UnixNano()),
+	)
+	guestAgentPort := chooseSessionAgentPort()
+	_ = os.Remove(socketPath)
+	defer func() {
+		_ = os.Remove(socketPath)
+	}()
+
 	execPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable path: %w", err)
-	}
-
-	ptmx, tty, err := pty.Open()
-	if err != nil {
-		return fmt.Errorf("open pty: %w", err)
-	}
-	defer func() {
-		_ = ptmx.Close()
-		_ = tty.Close()
-	}()
-
-	if startReq.pty != nil {
-		_ = pty.Setsize(ptmx, &pty.Winsize{
-			Rows: uint16(startReq.pty.Rows),
-			Cols: uint16(startReq.pty.Columns),
-		})
-	}
-	if err := configureHostPTY(tty, startReq.terminalModes); err != nil {
-		logger.Warn(
-			"failed to apply pty host terminal settings",
-			"event", "session_pty_mode_apply_failed",
-			"error", err.Error(),
-		)
 	}
 
 	cmd := exec.Command(execPath)
@@ -133,58 +160,125 @@ func runKrunPTYSession(
 		krunChildRootFSEnv+"="+cfg.RootFS,
 		krunChildInteractiveEnv+"=1",
 		krunChildExecCommandEnv+"="+startReq.execCommand,
+		krunChildUseGuestAgent+"=1",
+		krunChildAgentPortEnv+"="+strconv.FormatUint(uint64(guestAgentPort), 10),
+		krunChildAgentSockEnv+"="+socketPath,
+		krunChildAgentExecEnv+"="+defaultGuestAgentExecPath,
+		krunChildAgentDebugEnv+"=1",
 		"TERM="+resolveTERM(startReq),
 	)
-	cmd.Stdin = tty
-	cmd.Stdout = tty
-	cmd.Stderr = tty
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
 
-	logger.Info("starting krun vm for ssh pty session", "event", "session_vm_start")
+	logger.Info(
+		"starting krun vm guest-agent pty session",
+		"event", "session_vm_start",
+		"agent_socket_path", socketPath,
+		"agent_port", guestAgentPort,
+		"agent_exec_path", defaultGuestAgentExecPath,
+	)
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return fmt.Errorf("listen guest-agent socket: %w", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+	logger.Debug("guest-agent host socket listener ready", "event", "guest_agent_host_socket_ready", "path", socketPath)
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start vm child process: %w", err)
 	}
-	_ = tty.Close()
+	logger.Debug("vm child process started", "event", "session_vm_child_started", "pid", cmd.Process.Pid)
 
-	doneForward := make(chan struct{})
+	agentConn, err := acceptAgentSocket(listener, 20*time.Second, logger)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("accept guest agent socket: %w", err)
+	}
+	defer func() {
+		_ = agentConn.Close()
+	}()
+	logger.Info("guest-agent socket connected", "event", "guest_agent_connected", "agent_socket_path", socketPath)
+
+	startPayload := agentproto.StartPayload{
+		Term:    resolveTERM(startReq),
+		Rows:    valueOrDefault(startReq.pty, func(p *ptyRequest) uint32 { return p.Rows }, 24),
+		Columns: valueOrDefault(startReq.pty, func(p *ptyRequest) uint32 { return p.Columns }, 80),
+		Command: startReq.execCommand,
+	}
+	startPayloadBytes, err := agentproto.EncodeJSON(startPayload)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("encode start payload: %w", err)
+	}
+	if err := agentproto.WriteFrame(agentConn, agentproto.FrameStart, startPayloadBytes); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("send start payload: %w", err)
+	}
+	logger.Debug("sent guest-agent start payload", "event", "guest_agent_start_sent")
+
+	agentErrCh := make(chan error, 1)
+	agentExitCodeCh := make(chan int, 1)
+	go readGuestAgentFrames(logger, agentConn, channel, agentErrCh, agentExitCodeCh)
+
+	go forwardChannelInputToAgent(logger, agentConn, channel)
+	go forwardSessionControlToAgent(logger, agentConn, sessionControl)
+
+	cmdWaitCh := make(chan error, 1)
 	go func() {
-		defer close(doneForward)
-		for event := range sessionControl {
-			if event.ResizeColumns > 0 && event.ResizeRows > 0 {
-				_ = pty.Setsize(ptmx, &pty.Winsize{
-					Rows: uint16(event.ResizeRows),
-					Cols: uint16(event.ResizeColumns),
-				})
-			}
-			if event.Signal != "" {
-				_ = forwardSSHSignal(cmd.Process, event.Signal)
-			}
-		}
+		cmdWaitCh <- cmd.Wait()
 	}()
 
-	copyErrors := make(chan error, 2)
-	go pipeCopy(copyErrors, ptmx, channel)
-	go pipeCopy(copyErrors, channel, ptmx)
-
-	waitErr := cmd.Wait()
-	_ = ptmx.Close()
-
-	// Best-effort drain of copy goroutines after PTY close.
-	for range 2 {
+	select {
+	case err := <-agentErrCh:
+		_ = cmd.Process.Kill()
+		_ = <-cmdWaitCh
+		return fmt.Errorf("guest agent stream error: %w", err)
+	case exitCode := <-agentExitCodeCh:
+		waitErr := <-cmdWaitCh
+		if waitErr != nil {
+			return fmt.Errorf("run vm child process: %w", waitErr)
+		}
+		if exitCode != 0 {
+			return fmt.Errorf("guest agent exited with code %d", exitCode)
+		}
+	case waitErr := <-cmdWaitCh:
+		if waitErr != nil {
+			return fmt.Errorf("run vm child process: %w", waitErr)
+		}
 		select {
-		case <-copyErrors:
-		case <-doneForward:
+		case err := <-agentErrCh:
+			if err != nil && !errors.Is(err, io.EOF) {
+				return fmt.Errorf("guest agent stream error after vm exit: %w", err)
+			}
+		case exitCode := <-agentExitCodeCh:
+			if exitCode != 0 {
+				return fmt.Errorf("guest agent exited with code %d", exitCode)
+			}
+		case <-time.After(2 * time.Second):
+			return errors.New("guest agent did not send exit frame before timeout")
 		}
 	}
 
-	if waitErr != nil {
-		return fmt.Errorf("run vm child process: %w", waitErr)
-	}
-
-	logger.Info("krun vm pty session ended", "event", "session_vm_end")
+	logger.Info("krun vm guest-agent pty session ended", "event", "session_vm_end")
 	return nil
 }
 
-func runKrunInCurrentProcess(rootFS string, interactive bool, execCommand string, stdin, stdout, stderr *os.File) error {
+func runKrunInCurrentProcess(
+	rootFS string,
+	interactive bool,
+	execCommand string,
+	useGuestAgent bool,
+	guestAgentPort uint32,
+	guestAgentSocketPath string,
+	guestAgentExecPath string,
+	stdin, stdout, stderr *os.File,
+) error {
 	if err := initKrunLogLevel(); err != nil {
 		return err
 	}
@@ -210,23 +304,47 @@ func runKrunInCurrentProcess(rootFS string, interactive bool, execCommand string
 	}
 	env = append(env, "TERM="+resolveTermEnv())
 
-	execCfg := krun.ExecConfig{
-		Path: "/bin/sh",
-		Env:  env,
-	}
-	switch {
-	case execCommand != "":
-		execCfg.Args = []string{"-c", execCommand}
-	case interactive:
-		execCfg.Args = []string{"-i"}
-	default:
-		// Non-PTY shell sessions (for example ssh -T) should avoid forcing -i.
-		// Running interactive shell mode without a PTY can cause flaky command input.
-		execCfg.Args = nil
+	var execCfg krun.ExecConfig
+	if useGuestAgent {
+		execCfg = krun.ExecConfig{
+			Path: guestAgentExecPath,
+			Args: []string{"--port", strconv.FormatUint(uint64(guestAgentPort), 10)},
+			Env:  env,
+		}
+	} else {
+		execCfg = krun.ExecConfig{
+			Path: "/bin/sh",
+			Env:  env,
+		}
+		switch {
+		case execCommand != "":
+			execCfg.Args = []string{"-c", execCommand}
+		case interactive:
+			execCfg.Args = []string{"-i"}
+		default:
+			// Non-PTY shell sessions (for example ssh -T) should avoid forcing -i.
+			// Running interactive shell mode without a PTY can cause flaky command input.
+			execCfg.Args = nil
+		}
 	}
 
 	if err := ctx.SetExec(execCfg); err != nil {
 		return fmt.Errorf("set exec: %w", err)
+	}
+	childDebugf(stderr, "exec configured path=%s args=%v use_guest_agent=%t", execCfg.Path, execCfg.Args, useGuestAgent)
+
+	if useGuestAgent {
+		if guestAgentSocketPath == "" {
+			return errors.New("guest agent mode requires a host socket path")
+		}
+		childDebugf(stderr, "configuring guest-agent exec=%s port=%d socket=%s", guestAgentExecPath, guestAgentPort, guestAgentSocketPath)
+		if err := ctx.AddVsockPort(krun.VsockPortConfig{
+			Port:   guestAgentPort,
+			Path:   guestAgentSocketPath,
+			Listen: false,
+		}); err != nil {
+			return fmt.Errorf("add vsock port: %w", err)
+		}
 	}
 
 	if err := ctx.AddVirtioConsoleDefault(krun.VirtioConsoleConfig{
@@ -241,6 +359,7 @@ func runKrunInCurrentProcess(rootFS string, interactive bool, execCommand string
 	if startErr != nil {
 		return fmt.Errorf("start vm: %w", startErr)
 	}
+	childDebugf(stderr, "vm start enter completed")
 
 	return nil
 }
@@ -266,101 +385,154 @@ func resolveTermEnv() string {
 	return "xterm-256color"
 }
 
-func pipeCopy(errCh chan<- error, dst io.Writer, src io.Reader) {
-	_, err := io.Copy(dst, src)
-	if err != nil && !errors.Is(err, io.EOF) {
-		errCh <- err
+func acceptAgentSocket(listener net.Listener, timeout time.Duration, logger *slog.Logger) (net.Conn, error) {
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan acceptResult, 1)
+	go func() {
+		conn, err := listener.Accept()
+		resultCh <- acceptResult{conn: conn, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, result.err
+		}
+		return result.conn, nil
+	case <-time.After(timeout):
+		logger.Warn("timed out waiting for guest-agent connection", "event", "guest_agent_accept_timeout")
+		return nil, errors.New("timed out waiting for guest-agent connection")
+	}
+}
+
+func chooseSessionAgentPort() uint32 {
+	// Keep to user-space dynamic range and vary by time to reduce parallel collisions.
+	const minPort uint32 = 20000
+	const rangeSize uint32 = 30000
+	return minPort + uint32(time.Now().UnixNano()%int64(rangeSize))
+}
+
+func readGuestAgentFrames(
+	logger *slog.Logger,
+	conn net.Conn,
+	channel ssh.Channel,
+	errCh chan<- error,
+	exitCodeCh chan<- int,
+) {
+	for {
+		frameType, payload, err := agentproto.ReadFrame(conn)
+		if err != nil {
+			logger.Debug(
+				"guest-agent frame read ended",
+				"event", "guest_agent_frame_read_end",
+				"error", err.Error(),
+			)
+			errCh <- err
+			return
+		}
+
+		switch frameType {
+		case agentproto.FrameOutput:
+			if len(payload) > 0 {
+				if _, writeErr := channel.Write(payload); writeErr != nil {
+					errCh <- fmt.Errorf("write agent output to ssh channel: %w", writeErr)
+					return
+				}
+			}
+		case agentproto.FrameError:
+			if len(payload) > 0 {
+				logger.Warn(
+					"guest-agent reported error frame",
+					"event", "guest_agent_error_frame",
+					"error", string(payload),
+				)
+				_, _ = channel.Stderr().Write(payload)
+				_, _ = channel.Stderr().Write([]byte("\n"))
+			}
+		case agentproto.FrameExit:
+			var exitPayload agentproto.ExitPayload
+			if decodeErr := agentproto.DecodeJSON(payload, &exitPayload); decodeErr != nil {
+				errCh <- decodeErr
+				return
+			}
+			logger.Info("guest-agent exit frame received", "event", "guest_agent_exit_frame", "exit_code", exitPayload.Code)
+			exitCodeCh <- exitPayload.Code
+			return
+		default:
+			logger.Debug("unknown guest-agent frame ignored", "event", "guest_agent_unknown_frame", "type", frameType)
+		}
+	}
+}
+
+func forwardChannelInputToAgent(logger *slog.Logger, conn net.Conn, channel ssh.Channel) {
+	type closeWriter interface {
+		CloseWrite() error
+	}
+
+	buffer := make([]byte, 32*1024)
+	for {
+		readBytes, err := channel.Read(buffer)
+		if readBytes > 0 {
+			if writeErr := agentproto.WriteFrame(conn, agentproto.FrameStdin, buffer[:readBytes]); writeErr != nil {
+				logger.Warn(
+					"failed forwarding stdin frame to guest-agent",
+					"event", "guest_agent_stdin_forward_failed",
+					"error", writeErr.Error(),
+				)
+				return
+			}
+		}
+		if err != nil {
+			logger.Debug("ssh channel input closed", "event", "guest_agent_stdin_closed")
+			if closer, ok := conn.(closeWriter); ok {
+				_ = closer.CloseWrite()
+			}
+			return
+		}
+	}
+}
+
+func forwardSessionControlToAgent(logger *slog.Logger, conn net.Conn, sessionControl <-chan sessionControlEvent) {
+	for event := range sessionControl {
+		if event.ResizeRows > 0 && event.ResizeColumns > 0 {
+			payload, err := agentproto.EncodeJSON(agentproto.ResizePayload{
+				Rows:    event.ResizeRows,
+				Columns: event.ResizeColumns,
+			})
+			if err == nil {
+				logger.Debug(
+					"forwarding resize to guest-agent",
+					"event", "guest_agent_resize_forward",
+					"rows", event.ResizeRows,
+					"columns", event.ResizeColumns,
+				)
+				_ = agentproto.WriteFrame(conn, agentproto.FrameResize, payload)
+			}
+		}
+		if event.Signal != "" {
+			logger.Debug(
+				"forwarding signal to guest-agent",
+				"event", "guest_agent_signal_forward",
+				"signal", event.Signal,
+			)
+			_ = agentproto.WriteFrame(conn, agentproto.FrameSignal, []byte(event.Signal))
+		}
+	}
+}
+
+func valueOrDefault[T any](value *ptyRequest, getter func(*ptyRequest) T, fallback T) T {
+	if value == nil {
+		return fallback
+	}
+	return getter(value)
+}
+
+func childDebugf(stderr io.Writer, format string, args ...any) {
+	if os.Getenv(krunChildAgentDebugEnv) != "1" {
 		return
 	}
-	errCh <- nil
-}
-
-func forwardSSHSignal(process *os.Process, signalName string) error {
-	if process == nil {
-		return nil
-	}
-
-	trimmed := strings.ToUpper(strings.TrimPrefix(signalName, "SIG"))
-	signalMap := map[string]syscall.Signal{
-		"ABRT": syscall.SIGABRT,
-		"ALRM": syscall.SIGALRM,
-		"FPE":  syscall.SIGFPE,
-		"HUP":  syscall.SIGHUP,
-		"ILL":  syscall.SIGILL,
-		"INT":  syscall.SIGINT,
-		"KILL": syscall.SIGKILL,
-		"PIPE": syscall.SIGPIPE,
-		"QUIT": syscall.SIGQUIT,
-		"SEGV": syscall.SIGSEGV,
-		"TERM": syscall.SIGTERM,
-		"USR1": syscall.SIGUSR1,
-		"USR2": syscall.SIGUSR2,
-	}
-	sig, ok := signalMap[trimmed]
-	if !ok {
-		return nil
-	}
-
-	return process.Signal(sig)
-}
-
-func configureHostPTY(tty *os.File, modes ssh.TerminalModes) error {
-	termios, setRequest, err := getTTYTermios(tty.Fd())
-	if err != nil {
-		return err
-	}
-
-	// Keep this host PTY as a transport layer and avoid double line discipline
-	// with the guest shell TTY.
-	makeTermiosRaw(termios)
-	applyControlChars(termios, modes)
-	applyLineSpeed(termios, modes)
-
-	return unix.IoctlSetTermios(int(tty.Fd()), setRequest, termios)
-}
-
-func getTTYTermios(fd uintptr) (*unix.Termios, uint, error) {
-	getRequest, setRequest := termiosGetSetRequests()
-	termios, err := unix.IoctlGetTermios(int(fd), getRequest)
-	if err != nil {
-		return nil, 0, fmt.Errorf("get tty termios: %w", err)
-	}
-	return termios, setRequest, nil
-}
-
-func makeTermiosRaw(termios *unix.Termios) {
-	termios.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
-	termios.Oflag &^= unix.OPOST
-	termios.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
-	termios.Cflag &^= unix.CSIZE | unix.PARENB
-	termios.Cflag |= unix.CS8
-	termios.Cc[unix.VMIN] = 1
-	termios.Cc[unix.VTIME] = 0
-}
-
-func applyControlChars(termios *unix.Termios, modes ssh.TerminalModes) {
-	controlCharMappings := map[uint8]uint8{
-		ssh.VINTR:    unix.VINTR,
-		ssh.VQUIT:    unix.VQUIT,
-		ssh.VERASE:   unix.VERASE,
-		ssh.VKILL:    unix.VKILL,
-		ssh.VEOF:     unix.VEOF,
-		ssh.VEOL:     unix.VEOL,
-		ssh.VEOL2:    unix.VEOL2,
-		ssh.VSTART:   unix.VSTART,
-		ssh.VSTOP:    unix.VSTOP,
-		ssh.VSUSP:    unix.VSUSP,
-		ssh.VREPRINT: unix.VREPRINT,
-		ssh.VWERASE:  unix.VWERASE,
-		ssh.VLNEXT:   unix.VLNEXT,
-		ssh.VDISCARD: unix.VDISCARD,
-	}
-
-	for sshOpcode, ccIndex := range controlCharMappings {
-		value, exists := modes[sshOpcode]
-		if !exists {
-			continue
-		}
-		termios.Cc[ccIndex] = uint8(value)
-	}
+	_, _ = fmt.Fprintf(stderr, "[throwawaysh-child] "+format+"\n", args...)
 }
