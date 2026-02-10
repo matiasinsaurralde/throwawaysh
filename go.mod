@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/golangci/golangci-lint v1.64.8
+	github.com/mishushakov/libkrun-go v0.0.0-20260210100716-6127b7d1db7c
 	golang.org/x/crypto v0.48.0
 )
 
