@@ -62,11 +62,21 @@ const indexHTMLPage = `<!doctype html>
       border: 1px solid rgba(118,255,165,0.85);
       box-shadow: 0 0 18px rgba(63,255,141,0.7);
       cursor: pointer;
-      animation: drift 8s ease-in-out infinite;
+      transform-origin: center;
+      opacity: 1;
+      transition: box-shadow 160ms ease, border-color 160ms ease;
+      animation: pulse 7s ease-in-out infinite;
     }
     .node.selected {
       box-shadow: 0 0 24px rgba(255,255,255,0.8), 0 0 30px rgba(63,255,141,1);
       border-color: #ffffff;
+    }
+    .node.entering {
+      animation: node-enter 420ms ease-out forwards, pulse 7s ease-in-out 450ms infinite;
+    }
+    .node.exiting {
+      animation: node-exit 420ms ease-in forwards;
+      pointer-events: none;
     }
     .node-label {
       position: absolute;
@@ -81,10 +91,39 @@ const indexHTMLPage = `<!doctype html>
       padding: 2px 6px;
       pointer-events: none;
     }
-    @keyframes drift {
+    @keyframes pulse {
       0%   { transform: translate(0, 0); }
-      50%  { transform: translate(4px, -3px); }
+      50%  { transform: translate(0, -1px); }
       100% { transform: translate(0, 0); }
+    }
+    @keyframes node-enter {
+      0% {
+        opacity: 0;
+        transform: scale(0.25);
+        filter: blur(1.5px);
+      }
+      55% {
+        opacity: 1;
+        transform: scale(1.15);
+        filter: blur(0);
+      }
+      100% {
+        opacity: 1;
+        transform: scale(1);
+        filter: blur(0);
+      }
+    }
+    @keyframes node-exit {
+      0% {
+        opacity: 1;
+        transform: scale(1);
+        filter: blur(0);
+      }
+      100% {
+        opacity: 0;
+        transform: scale(0.2);
+        filter: blur(2px);
+      }
     }
     .terminal {
       position: absolute;
@@ -134,9 +173,14 @@ const indexHTMLPage = `<!doctype html>
     const terminalStatusEl = document.getElementById('terminalStatus');
     const terminalTitleEl = document.getElementById('terminalTitle');
 
-    const nodePositions = new Map();
+    const nodeState = new Map();
     let selectedSessionID = '';
     let stream = null;
+    let physicsStarted = false;
+
+    function randomBetween(min, max) {
+      return min + Math.random() * (max - min);
+    }
 
     function humanDuration(seconds) {
       if (seconds < 60) return seconds + 's';
@@ -209,44 +253,135 @@ const indexHTMLPage = `<!doctype html>
       };
     }
 
-    function positionForSession(id) {
-      if (!nodePositions.has(id)) {
-        const x = 6 + Math.random() * 86;
-        const y = 10 + Math.random() * 78;
-        nodePositions.set(id, { x, y });
+    function createNodeState(session) {
+      const node = document.createElement('div');
+      node.className = 'node entering';
+      node.dataset.sessionId = session.id;
+
+      const label = document.createElement('div');
+      label.className = 'node-label';
+      node.appendChild(label);
+      universeEl.appendChild(node);
+
+      const state = {
+        id: session.id,
+        el: node,
+        labelEl: label,
+        x: randomBetween(6, 92),
+        y: randomBetween(10, 88),
+        vx: randomBetween(-0.006, 0.006),
+        vy: randomBetween(-0.006, 0.006),
+        driftX: randomBetween(-0.0025, 0.0025),
+        driftY: randomBetween(-0.0025, 0.0025),
+      };
+      nodeState.set(session.id, state);
+
+      node.addEventListener('click', () => {
+        selectedSessionID = session.id;
+        openStream(session);
+      });
+      setTimeout(() => {
+        if (node.isConnected) {
+          node.classList.remove('entering');
+        }
+      }, 460);
+      return state;
+    }
+
+    function updateNodeLabel(state, session) {
+      if (!state || !state.labelEl) return;
+      const node = state.el;
+      node.classList.toggle('selected', selectedSessionID === session.id);
+      if (!node.style.animationDelay) {
+        node.style.animationDelay = (Math.random() * 2).toFixed(2) + 's';
       }
-      return nodePositions.get(id);
+      const flag = session.country_flag ? session.country_flag + ' ' : '';
+      state.labelEl.textContent =
+        flag + session.remote_ip + ' [' + humanDuration(session.duration_seconds) + ']\n' +
+        'user: ' + (session.username || '<none>') + ' pass: ' + (session.password || '<none>');
+    }
+
+    function removeNode(sessionID) {
+      const state = nodeState.get(sessionID);
+      if (!state) return;
+      const node = state.el;
+      node.classList.add('exiting');
+      node.classList.remove('selected');
+      setTimeout(() => {
+        if (node.parentNode) {
+          node.parentNode.removeChild(node);
+        }
+        nodeState.delete(sessionID);
+      }, 430);
+    }
+
+    function startPhysicsLoop() {
+      if (physicsStarted) return;
+      physicsStarted = true;
+      const centerX = 50;
+      const centerY = 50;
+      const pull = 0.00008;
+      const friction = 0.996;
+      const maxSpeed = 0.04;
+      const jitter = 0.00018;
+
+      function step() {
+        nodeState.forEach((state) => {
+          if (!state.el.isConnected) return;
+          const dx = centerX - state.x;
+          const dy = centerY - state.y;
+          state.vx += dx * pull + state.driftX + randomBetween(-jitter, jitter);
+          state.vy += dy * pull + state.driftY + randomBetween(-jitter, jitter);
+          state.vx *= friction;
+          state.vy *= friction;
+
+          if (state.vx > maxSpeed) state.vx = maxSpeed;
+          if (state.vx < -maxSpeed) state.vx = -maxSpeed;
+          if (state.vy > maxSpeed) state.vy = maxSpeed;
+          if (state.vy < -maxSpeed) state.vy = -maxSpeed;
+
+          state.x += state.vx;
+          state.y += state.vy;
+
+          if (state.x < 2) {
+            state.x = 2;
+            state.vx = Math.abs(state.vx) * 0.6;
+          } else if (state.x > 97) {
+            state.x = 97;
+            state.vx = -Math.abs(state.vx) * 0.6;
+          }
+          if (state.y < 7) {
+            state.y = 7;
+            state.vy = Math.abs(state.vy) * 0.6;
+          } else if (state.y > 93) {
+            state.y = 93;
+            state.vy = -Math.abs(state.vy) * 0.6;
+          }
+
+          state.el.style.left = state.x + '%';
+          state.el.style.top = state.y + '%';
+        });
+        window.requestAnimationFrame(step);
+      }
+      window.requestAnimationFrame(step);
     }
 
     function renderNodes(sessions) {
-      const activeIDs = new Set(sessions.map((s) => s.id));
-      for (const key of nodePositions.keys()) {
-        if (!activeIDs.has(key)) nodePositions.delete(key);
-      }
+      startPhysicsLoop();
+      const activeIDs = new Set(sessions.map((session) => session.id));
 
-      universeEl.innerHTML = '';
+      nodeState.forEach((_state, sessionID) => {
+        if (!activeIDs.has(sessionID)) {
+          removeNode(sessionID);
+        }
+      });
+
       sessions.forEach((session) => {
-        const pos = positionForSession(session.id);
-        const node = document.createElement('div');
-        node.className = 'node' + (session.id === selectedSessionID ? ' selected' : '');
-        node.style.left = pos.x + '%';
-        node.style.top = pos.y + '%';
-        node.style.animationDelay = (Math.random() * 2).toFixed(2) + 's';
-
-        const label = document.createElement('div');
-        label.className = 'node-label';
-        const flag = session.country_flag ? session.country_flag + ' ' : '';
-        label.textContent =
-          flag + session.remote_ip + ' [' + humanDuration(session.duration_seconds) + ']\n' +
-          'user: ' + (session.username || '<none>') + ' pass: ' + (session.password || '<none>');
-        node.appendChild(label);
-
-        node.addEventListener('click', () => {
-          selectedSessionID = session.id;
-          renderNodes(sessions);
-          openStream(session);
-        });
-        universeEl.appendChild(node);
+        let state = nodeState.get(session.id);
+        if (!state) {
+          state = createNodeState(session);
+        }
+        updateNodeLabel(state, session);
       });
 
       nodeStatusEl.textContent = sessions.length + ' active sessions';
