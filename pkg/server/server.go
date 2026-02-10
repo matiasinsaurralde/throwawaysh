@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -29,7 +30,7 @@ func New(cfg Config, signer ssh.Signer, logger *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	listener, err := net.Listen("tcp", s.cfg.ListenAddr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.ListenAddr, err)
 	}
@@ -37,7 +38,8 @@ func (s *Server) Run(ctx context.Context) error {
 		_ = listener.Close()
 	}()
 
-	s.logger.Info(
+	s.logger.InfoContext(
+		ctx,
 		"service started",
 		"event", "service_started",
 		"listen_addr", s.cfg.ListenAddr,
@@ -50,21 +52,23 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
 			if ctx.Err() != nil {
-				s.logger.Info("service stopped", "event", "service_stopped")
+				s.logger.InfoContext(ctx, "service stopped", "event", "service_stopped")
 				return nil
 			}
-			s.logger.Error(
+			s.logger.ErrorContext(
+				ctx,
 				"failed accepting connection",
 				"event", "listener_accept_failed",
-				"error", err.Error(),
+				"error", acceptErr.Error(),
 			)
 			continue
 		}
 
-		s.logger.Info(
+		s.logger.InfoContext(
+			ctx,
 			"connection accepted",
 			"event", "connection_accepted",
 			"remote_addr", conn.RemoteAddr().String(),
@@ -91,7 +95,7 @@ func (s *Server) buildSSHConfig(signer ssh.Signer) *ssh.ServerConfig {
 					"username", username,
 					"auth_mode", "password",
 				)
-				return nil, nil
+				return &ssh.Permissions{}, nil
 			}
 
 			s.logger.Warn(
@@ -101,7 +105,7 @@ func (s *Server) buildSSHConfig(signer ssh.Signer) *ssh.ServerConfig {
 				"username", username,
 				"auth_mode", "password",
 			)
-			return nil, fmt.Errorf("invalid credentials")
+			return nil, errors.New("invalid credentials")
 		}
 	}
 
@@ -154,14 +158,14 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		channel, requests, err := newChannel.Accept()
-		if err != nil {
+		channel, requests, acceptErr := newChannel.Accept()
+		if acceptErr != nil {
 			s.logger.Error(
 				"failed accepting channel",
 				"event", "channel_accept_failed",
 				"remote_addr", serverConn.RemoteAddr().String(),
 				"username", serverConn.User(),
-				"error", err.Error(),
+				"error", acceptErr.Error(),
 			)
 			continue
 		}

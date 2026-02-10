@@ -11,6 +11,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const hostKeyBits = 2048
+
 func LoadOrCreateHostSigner(path string) (ssh.Signer, error) {
 	keyData, err := os.ReadFile(path)
 	if err == nil {
@@ -20,7 +22,7 @@ func LoadOrCreateHostSigner(path string) (ssh.Signer, error) {
 		return nil, err
 	}
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	privateKey, err := rsa.GenerateKey(rand.Reader, hostKeyBits)
 	if err != nil {
 		return nil, err
 	}
@@ -29,8 +31,9 @@ func LoadOrCreateHostSigner(path string) (ssh.Signer, error) {
 	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}
 	pemData := pem.EncodeToMemory(block)
 
-	if err := os.WriteFile(path, pemData, 0o600); err != nil {
-		return nil, err
+	writeErr := os.WriteFile(path, pemData, 0o600)
+	if writeErr != nil {
+		return nil, writeErr
 	}
 
 	return ssh.ParsePrivateKey(pemData)

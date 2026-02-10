@@ -23,7 +23,7 @@ func main() {
 	}
 
 	if result.ShowVersion {
-		fmt.Printf("throwawaysh %s\n", version)
+		_, _ = fmt.Fprintf(os.Stdout, "throwawaysh %s\n", version)
 		return
 	}
 
@@ -52,10 +52,11 @@ func main() {
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
-	if err := srv.Run(ctx); err != nil {
-		logger.Error("server exited with error", "event", "server_runtime_error", "error", err.Error())
+	runErr := srv.Run(ctx)
+	cancel()
+	if runErr != nil {
+		logger.Error("server exited with error", "event", "server_runtime_error", "error", runErr.Error())
 		os.Exit(1)
 	}
 }

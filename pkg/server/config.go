@@ -18,6 +18,7 @@ const (
 type Config struct {
 	ListenAddr        string
 	HostKeyPath       string
+	RootFS            string
 	Username          string
 	Password          string
 	AllowPasswordless bool

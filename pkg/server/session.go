@@ -11,7 +11,12 @@ type exitStatus struct {
 	Status uint32
 }
 
-func handleSession(logger *slog.Logger, channel ssh.Channel, requests <-chan *ssh.Request, remoteAddr, username string) {
+func handleSession(
+	logger *slog.Logger,
+	channel ssh.Channel,
+	requests <-chan *ssh.Request,
+	remoteAddr, username string,
+) {
 	defer func() {
 		_ = channel.Close()
 		logger.Info(

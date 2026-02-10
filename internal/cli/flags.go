@@ -21,6 +21,7 @@ func Parse(args []string) (ParseResult, error) {
 
 	listenAddr := fs.String("listen-addr", "", "SSH listen address (for example, :2222)")
 	hostKeyPath := fs.String("host-key-path", "", "Path to the SSH host private key")
+	rootFS := fs.String("rootfs", "", "Path to root filesystem directory")
 	username := fs.String("username", "", "Username required for password auth")
 	password := fs.String("password", "", "Password required for password auth")
 	allowPasswordless := fs.Bool("allow-passwordless", false, "Allow auth-less login for any username")
@@ -48,20 +49,64 @@ func Parse(args []string) (ParseResult, error) {
 	}
 
 	cfg := server.Config{
-		ListenAddr:        resolveString(visited["listen-addr"], *listenAddr, "SSH_ADDR", server.DefaultListenAddr),
-		HostKeyPath:       resolveString(visited["host-key-path"], *hostKeyPath, "SSH_HOST_KEY_PATH", server.DefaultHostKeyPath),
-		Username:          resolveString(visited["username"], *username, "SSH_USERNAME", server.DefaultUsername),
-		Password:          resolveString(visited["password"], *password, "SSH_PASSWORD", server.DefaultPassword),
+		ListenAddr: resolveString(
+			visited["listen-addr"],
+			*listenAddr,
+			"SSH_ADDR",
+			server.DefaultListenAddr,
+		),
+		HostKeyPath: resolveString(
+			visited["host-key-path"],
+			*hostKeyPath,
+			"SSH_HOST_KEY_PATH",
+			server.DefaultHostKeyPath,
+		),
+		RootFS: resolveString(
+			visited["rootfs"],
+			*rootFS,
+			"SSH_ROOTFS",
+			"",
+		),
+		Username: resolveString(
+			visited["username"],
+			*username,
+			"SSH_USERNAME",
+			server.DefaultUsername,
+		),
+		Password: resolveString(
+			visited["password"],
+			*password,
+			"SSH_PASSWORD",
+			server.DefaultPassword,
+		),
 		AllowPasswordless: allowPasswordlessValue,
-		LogLevel:          strings.ToLower(resolveString(visited["log-level"], *logLevel, "SSH_LOG_LEVEL", server.DefaultLogLevel)),
-		LogFormat:         strings.ToLower(resolveString(visited["log-format"], *logFormat, "SSH_LOG_FORMAT", server.DefaultLogFormat)),
+		LogLevel: strings.ToLower(
+			resolveString(
+				visited["log-level"],
+				*logLevel,
+				"SSH_LOG_LEVEL",
+				server.DefaultLogLevel,
+			),
+		),
+		LogFormat: strings.ToLower(
+			resolveString(
+				visited["log-format"],
+				*logFormat,
+				"SSH_LOG_FORMAT",
+				server.DefaultLogFormat,
+			),
+		),
 	}
 
-	if err := cfg.Validate(); err != nil {
-		return ParseResult{}, err
+	validateErr := cfg.Validate()
+	if validateErr != nil {
+		return ParseResult{}, validateErr
 	}
 
-	credentialsProvided := visited["username"] || visited["password"] || os.Getenv("SSH_USERNAME") != "" || os.Getenv("SSH_PASSWORD") != ""
+	credentialsProvided := visited["username"] ||
+		visited["password"] ||
+		os.Getenv("SSH_USERNAME") != "" ||
+		os.Getenv("SSH_PASSWORD") != ""
 
 	return ParseResult{
 		Config:              cfg,
