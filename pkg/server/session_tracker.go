@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +37,10 @@ type trackedSession struct {
 	subscribers map[chan string]struct{}
 	done        chan struct{}
 	ended       bool
+	inputLine   strings.Builder
+	outputLine  strings.Builder
+	inputEscape bool
+	outputEscape bool
 }
 
 type SessionTracker struct {
@@ -109,6 +112,7 @@ func (t *SessionTracker) End(sessionID string) {
 		session.mu.Unlock()
 		return
 	}
+	session.flushPendingLinesLocked()
 	session.ended = true
 	_ = session.logFile.Close()
 	for sub := range session.subscribers {
@@ -192,26 +196,67 @@ func (s *trackedSession) ID() string {
 }
 
 func (s *trackedSession) LogInput(payload []byte) {
-	s.appendLogChunk("IN ", payload)
+	s.appendLogChunk("IN ", payload, &s.inputLine, &s.inputEscape)
 }
 
 func (s *trackedSession) LogOutput(payload []byte) {
-	s.appendLogChunk("OUT", payload)
+	s.appendLogChunk("OUT", payload, &s.outputLine, &s.outputEscape)
 }
 
-func (s *trackedSession) appendLogChunk(direction string, payload []byte) {
-	chunk := strings.TrimSpace(strconv.QuoteToASCII(string(payload)))
-	if chunk == `""` || chunk == "" {
-		return
-	}
-	chunk = strings.Trim(chunk, `"`)
-	entry := fmt.Sprintf("[%s] %s %s\n", time.Now().UTC().Format(time.RFC3339), direction, chunk)
-
+func (s *trackedSession) appendLogChunk(
+	direction string,
+	payload []byte,
+	lineBuffer *strings.Builder,
+	escapeState *bool,
+) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ended {
 		return
 	}
+
+	for _, singleByte := range payload {
+		if *escapeState {
+			// Best-effort skip for ANSI escape sequences.
+			if (singleByte >= 0x40 && singleByte <= 0x7e) || singleByte == '\a' {
+				*escapeState = false
+			}
+			continue
+		}
+
+		if singleByte == 0x1b {
+			*escapeState = true
+			continue
+		}
+
+		switch singleByte {
+		case '\r', '\n':
+			s.flushLineLocked(direction, lineBuffer)
+		case '\t':
+			_ = lineBuffer.WriteByte(singleByte)
+		default:
+			if singleByte >= 32 || singleByte >= 128 {
+				_ = lineBuffer.WriteByte(singleByte)
+			}
+		}
+	}
+}
+
+func (s *trackedSession) flushPendingLinesLocked() {
+	s.flushLineLocked("IN ", &s.inputLine)
+	s.flushLineLocked("OUT", &s.outputLine)
+}
+
+func (s *trackedSession) flushLineLocked(direction string, lineBuffer *strings.Builder) {
+	line := lineBuffer.String()
+	lineBuffer.Reset()
+
+	line = strings.TrimRight(line, " \t")
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+
+	entry := fmt.Sprintf("[%s] %s %s\n", time.Now().UTC().Format(time.RFC3339), direction, line)
 	if _, err := s.logFile.WriteString(entry); err != nil {
 		return
 	}
