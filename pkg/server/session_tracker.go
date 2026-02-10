@@ -39,9 +39,21 @@ type trackedSession struct {
 	ended       bool
 	inputLine   strings.Builder
 	outputLine  strings.Builder
-	inputEscape bool
-	outputEscape bool
+	inputParserState  escapeParserState
+	outputParserState escapeParserState
 }
+
+type escapeParserState uint8
+
+const (
+	parserStatePlain escapeParserState = iota
+	parserStateESC
+	parserStateCSI
+	parserStateOSC
+	parserStateOSCEscape
+	parserStateString
+	parserStateStringEscape
+)
 
 type SessionTracker struct {
 	logger *slog.Logger
@@ -196,18 +208,18 @@ func (s *trackedSession) ID() string {
 }
 
 func (s *trackedSession) LogInput(payload []byte) {
-	s.appendLogChunk("IN ", payload, &s.inputLine, &s.inputEscape)
+	s.appendLogChunk("IN ", payload, &s.inputLine, &s.inputParserState)
 }
 
 func (s *trackedSession) LogOutput(payload []byte) {
-	s.appendLogChunk("OUT", payload, &s.outputLine, &s.outputEscape)
+	s.appendLogChunk("OUT", payload, &s.outputLine, &s.outputParserState)
 }
 
 func (s *trackedSession) appendLogChunk(
 	direction string,
 	payload []byte,
 	lineBuffer *strings.Builder,
-	escapeState *bool,
+	parserState *escapeParserState,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -216,27 +228,59 @@ func (s *trackedSession) appendLogChunk(
 	}
 
 	for _, singleByte := range payload {
-		if *escapeState {
-			// Best-effort skip for ANSI escape sequences.
-			if (singleByte >= 0x40 && singleByte <= 0x7e) || singleByte == '\a' {
-				*escapeState = false
-			}
-			continue
-		}
-
-		if singleByte == 0x1b {
-			*escapeState = true
-			continue
-		}
-
-		switch singleByte {
-		case '\r', '\n':
-			s.flushLineLocked(direction, lineBuffer)
-		case '\t':
-			_ = lineBuffer.WriteByte(singleByte)
-		default:
-			if singleByte >= 32 || singleByte >= 128 {
+		switch *parserState {
+		case parserStatePlain:
+			switch singleByte {
+			case 0x1b:
+				*parserState = parserStateESC
+			case '\r', '\n':
+				s.flushLineLocked(direction, lineBuffer)
+			case '\t':
 				_ = lineBuffer.WriteByte(singleByte)
+			default:
+				if singleByte >= 32 || singleByte >= 128 {
+					_ = lineBuffer.WriteByte(singleByte)
+				}
+			}
+		case parserStateESC:
+			switch singleByte {
+			case '[':
+				*parserState = parserStateCSI
+			case ']':
+				*parserState = parserStateOSC
+			case 'P', 'X', '^', '_':
+				*parserState = parserStateString
+			default:
+				*parserState = parserStatePlain
+			}
+		case parserStateCSI:
+			// CSI ends at a final byte in the 0x40..0x7e range.
+			if singleByte >= 0x40 && singleByte <= 0x7e {
+				*parserState = parserStatePlain
+			}
+		case parserStateOSC:
+			// OSC ends on BEL or ST (ESC \).
+			if singleByte == '\a' {
+				*parserState = parserStatePlain
+			} else if singleByte == 0x1b {
+				*parserState = parserStateOSCEscape
+			}
+		case parserStateOSCEscape:
+			if singleByte == '\\' {
+				*parserState = parserStatePlain
+			} else {
+				*parserState = parserStateOSC
+			}
+		case parserStateString:
+			// DCS/PM/APC strings end with ST (ESC \).
+			if singleByte == 0x1b {
+				*parserState = parserStateStringEscape
+			}
+		case parserStateStringEscape:
+			if singleByte == '\\' {
+				*parserState = parserStatePlain
+			} else {
+				*parserState = parserStateString
 			}
 		}
 	}
